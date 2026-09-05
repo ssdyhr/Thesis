@@ -1,0 +1,395 @@
+---
+title: "driver_mutations_tests"
+output: html_document
+date: "2026-06-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+
+library(tidyverse)
+
+possible_roots <- c("~/GenomeDK", "faststorage/Project", "/home/animaldyhr", "")
+
+smart_read <- function(relative_path, read_func = readRDS, ...) {
+  full_paths <- file.path(possible_roots, relative_path)
+  existing_path <- full_paths[file.exists(full_paths)][1]
+  
+  if (is.na(existing_path)) {
+    stop(paste("No root for:", relative_path))
+  }
+  return(read_func(existing_path, ...))
+}
+
+library(tidyverse)
+library(broom)
+
+drivers <- smart_read("thesis/data/TCGA_Derived_data/TCGA_annotated_driver_mutations.rds")
+clin <- smart_read("thesis/data/TCGA_clinical/clinical_dataset.rds")
+subtypes <- smart_read("thesis/data/subtypes.rds")
+col
+clin <- clin |> rename(sampleid = `_PATIENT`)
+clin$BMI <- clin$weight / (clin$height/100)^2
+clin$BMI <- clin$weight / (clin$height/100)^2
+
+
+clin <- clin |>
+  mutate(
+    bmi_binary = case_when(
+      BMI >= 25        ~ "Elevated",
+      BMI < 25         ~ "Normal",
+      TRUE             ~ NA_character_
+    ),
+    bmi_binary = factor(bmi_binary, levels = c("Normal", "Elevated"))
+  ) |>
+  mutate(
+    age_cat = if_else(age_at_initial_pathologic_diagnosis < 65, "young", "old"),
+    age_cat = factor(age_cat, levels = c("young", "old"))
+  )
+
+colnames(drivers)
+
+```
+
+
+
+```{r}
+library(broom)
+library(tidyverse)
+library(ggrepel)
+library(patchwork)
+library(cowplot)
+library(RColorBrewer)
+
+# setup
+all_cancer_types <- clin |>
+  drop_na(`cancer type abbreviation`) |>
+  pull(`cancer type abbreviation`) |>
+  unique() |>
+  sort()
+
+n <- length(all_cancer_types)
+palette_cols <- colorRampPalette(brewer.pal(12, "Paired"))(n)
+cancer_colours <- c(setNames(palette_cols, all_cancer_types), "Other" = "grey80")
+
+mut_clean <- drivers |>
+  filter(pan_cancer_driver == TRUE | is_driver_mut == TRUE | is_cosmic_gte_3 == TRUE) |>
+  select(sampleid, gene.refgene, cancertype) |>
+  distinct(sampleid, gene.refgene, .keep_all = TRUE)
+
+clin_clean <- clin |>
+  select(sampleid, gender, age_at_initial_pathologic_diagnosis, BMI) |>
+  filter(BMI >= 10, BMI <= 60) |>
+  distinct(sampleid, .keep_all = TRUE)
+
+n_drivers_per_sample <- mut_clean |>
+  group_by(sampleid, cancertype) |>
+  summarise(n_drivers = n(), .groups = "drop")
+
+driver_weight_clin <- mut_clean |>
+  group_by(sampleid, cancertype) |>
+  mutate(n_drivers = n(),
+         driver_weight = 1 / n_drivers) |>
+  ungroup() |>
+  left_join(clin_clean, by = "sampleid")
+
+cancer_types_5c <- mut_clean |> pull(cancertype) |> unique()
+
+# driver weight spearman correlations
+gene_weight_results_bmi <- driver_weight_clin |>
+  drop_na(BMI, cancertype) |>
+  filter(cancertype != "UCEC") |>
+  group_by(cancertype, gene.refgene) |>
+  filter(n() >= 10, var(driver_weight) > 0) |>
+  summarise(
+    cor_val = tryCatch(cor.test(driver_weight, BMI, method = "spearman", exact = FALSE)$estimate, error = function(e) NA_real_),
+    p_val   = tryCatch(cor.test(driver_weight, BMI, method = "spearman", exact = FALSE)$p.value,  error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  drop_na(p_val) |>
+  mutate(p_adj = p.adjust(p_val, method = "BH"),
+         is_sig = p_val < 0.05,
+         label  = if_else(is_sig, paste0(cancertype, ":", gene.refgene), NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+gene_weight_results_age <- driver_weight_clin |>
+  drop_na(age_at_initial_pathologic_diagnosis, cancertype) |>
+  group_by(cancertype, gene.refgene) |>
+  filter(n() >= 10, var(driver_weight) > 0) |>
+  summarise(
+    cor_val = tryCatch(cor.test(driver_weight, age_at_initial_pathologic_diagnosis, method = "spearman", exact = FALSE)$estimate, error = function(e) NA_real_),
+    p_val   = tryCatch(cor.test(driver_weight, age_at_initial_pathologic_diagnosis, method = "spearman", exact = FALSE)$p.value,  error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  drop_na(p_val) |>
+  mutate(p_adj = p.adjust(p_val, method = "BH"),
+         is_sig = p_val < 0.05,
+         label  = if_else(is_sig, paste0(cancertype, ":", gene.refgene), NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+gene_weight_results_gender <- driver_weight_clin |>
+  drop_na(gender, cancertype) |>
+  group_by(cancertype, gene.refgene) |>
+  filter(n_distinct(gender) == 2,
+         sum(gender == "MALE") >= 3,
+         sum(gender == "FEMALE") >= 3,
+         var(driver_weight) > 0) |>
+  summarise(
+    mean_diff = mean(driver_weight[gender == "MALE"], na.rm = TRUE) -
+                mean(driver_weight[gender == "FEMALE"], na.rm = TRUE),
+    p_val = tryCatch(wilcox.test(driver_weight[gender == "MALE"], driver_weight[gender == "FEMALE"], exact = FALSE)$p.value, error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  drop_na(p_val) |>
+  mutate(p_adj = p.adjust(p_val, method = "BH"),
+         is_sig = p_val < 0.05,
+         label  = if_else(is_sig, paste0(cancertype, ":", gene.refgene), NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+# total driver count correlations
+bmi_driver_results <- clin |>
+  select(sampleid, BMI) |>
+  filter(BMI >= 10, BMI <= 60) |>
+  distinct(sampleid, .keep_all = TRUE) |>
+  left_join(n_drivers_per_sample, by = "sampleid") |>
+  drop_na(BMI, n_drivers, cancertype) |>
+  group_by(cancertype) |>
+  filter(n() >= 10, var(n_drivers) > 0) |>
+  summarise(
+    cor_val = tryCatch(cor.test(n_drivers, BMI, method = "spearman", exact = FALSE)$estimate, error = function(e) NA_real_),
+    p_val   = tryCatch(cor.test(n_drivers, BMI, method = "spearman", exact = FALSE)$p.value,  error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  drop_na(p_val) |>
+  mutate(p_adj = p.adjust(p_val, method = "BH"),
+         is_sig = p_val < 0.05,
+         label  = if_else(is_sig, cancertype, NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+age_driver_results <- clin |>
+  select(sampleid, age_at_initial_pathologic_diagnosis) |>
+  distinct(sampleid, .keep_all = TRUE) |>
+  left_join(n_drivers_per_sample, by = "sampleid") |>
+  drop_na(age_at_initial_pathologic_diagnosis, n_drivers, cancertype) |>
+  group_by(cancertype) |>
+  filter(n() >= 10, var(n_drivers) > 0) |>
+  summarise(
+    cor_val = tryCatch(cor.test(n_drivers, age_at_initial_pathologic_diagnosis, method = "spearman", exact = FALSE)$estimate, error = function(e) NA_real_),
+    p_val   = tryCatch(cor.test(n_drivers, age_at_initial_pathologic_diagnosis, method = "spearman", exact = FALSE)$p.value,  error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  drop_na(p_val) |>
+  mutate(p_adj = p.adjust(p_val, method = "BH"),
+         is_sig = p_val < 0.05,
+         label  = if_else(is_sig, cancertype, NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+gender_driver_results <- clin |>
+  select(sampleid, gender) |>
+  distinct(sampleid, .keep_all = TRUE) |>
+  left_join(n_drivers_per_sample, by = "sampleid") |>
+  drop_na(gender, n_drivers, cancertype) |>
+  group_by(cancertype) |>
+  filter(n_distinct(gender) == 2,
+         sum(gender == "MALE") >= 3,
+         sum(gender == "FEMALE") >= 3,
+         var(n_drivers) > 0) |>
+  summarise(
+    mean_diff = mean(n_drivers[gender == "MALE"], na.rm = TRUE) -
+                mean(n_drivers[gender == "FEMALE"], na.rm = TRUE),
+    p_val = tryCatch(wilcox.test(n_drivers[gender == "MALE"], n_drivers[gender == "FEMALE"], exact = FALSE)$p.value, error = function(e) NA_real_),
+    .groups = "drop"
+  ) |>
+  drop_na(p_val) |>
+  mutate(p_adj = p.adjust(p_val, method = "BH"),
+         is_sig = p_val < 0.05,
+         label  = if_else(is_sig, cancertype, NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+# logistic regression
+results_all <- map_dfr(cancer_types_5c, function(ct) {
+  ct_samples <- clin_clean |>
+    filter(sampleid %in% (mut_clean |> filter(cancertype == ct) |> pull(sampleid)))
+  single_gender <- n_distinct(ct_samples$gender, na.rm = TRUE) == 1
+  valid_genes <- mut_clean |>
+    filter(cancertype == ct) |>
+    distinct(sampleid, gene.refgene) |>
+    left_join(ct_samples |> select(sampleid, gender), by = "sampleid") |>
+    group_by(gene.refgene) |>
+    summarise(n_mutated = n_distinct(sampleid),
+              n_male    = n_distinct(sampleid[gender == "MALE"], na.rm = TRUE),
+              n_female  = n_distinct(sampleid[gender == "FEMALE"], na.rm = TRUE),
+              .groups = "drop") |>
+    filter(n_mutated >= 5, n_mutated <= nrow(ct_samples) - 5,
+           if (!single_gender) n_male >= 3 & n_female >= 3 else TRUE) |>
+    pull(gene.refgene)
+  if (length(valid_genes) == 0) return(NULL)
+  map_dfr(valid_genes, function(gene) {
+    gene_data <- mut_clean |>
+      filter(cancertype == ct, gene.refgene == gene) |>
+      select(sampleid) |>
+      distinct() |>
+      mutate(is_mutated = 1L) |>
+      right_join(ct_samples, by = "sampleid") |>
+      mutate(is_mutated = replace_na(is_mutated, 0L))
+    glm_formula <- if (single_gender) {
+      is_mutated ~ age_at_initial_pathologic_diagnosis + BMI
+    } else {
+      is_mutated ~ gender + age_at_initial_pathologic_diagnosis + BMI
+    }
+    tryCatch({
+      suppressWarnings(
+        glm(glm_formula, data = gene_data, family = "binomial") |>
+          tidy(exponentiate = TRUE, conf.int = TRUE) |>
+          mutate(gene = gene, cancertype = ct)
+      )
+    }, error = function(e) NULL)
+  })
+})
+
+fig5c_bmi <- results_all |>
+  filter(term == "BMI", estimate > 0.01, estimate < 100) |>
+  group_by(cancertype) |>
+  mutate(p_adj = p.adjust(p.value, method = "BH")) |>
+  ungroup() |>
+  mutate(is_sig = p_adj < 0.05,
+         label  = if_else(is_sig, paste0(cancertype, ":", gene), NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+fig5c_age <- results_all |>
+  filter(term == "age_at_initial_pathologic_diagnosis", estimate > 0.01, estimate < 100) |>
+  group_by(cancertype) |>
+  mutate(p_adj = p.adjust(p.value, method = "BH")) |>
+  ungroup() |>
+  mutate(is_sig = p_adj < 0.05,
+         label  = if_else(is_sig, paste0(cancertype, ":", gene), NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+fig5c_gender <- results_all |>
+  filter(term == "genderMALE", estimate > 0.01, estimate < 100) |>
+  group_by(cancertype) |>
+  mutate(p_adj = p.adjust(p.value, method = "BH")) |>
+  ungroup() |>
+  mutate(is_sig = p_adj < 0.05,
+         label  = if_else(is_sig, paste0(cancertype, ":", gene), NA_character_),
+         label_type = if_else(cancertype %in% all_cancer_types, cancertype, "Other"))
+
+# shared sig limits for colour consistency across panels
+all_sig_bmi <- unique(c(
+  filter(gene_weight_results_bmi, is_sig) |> pull(label_type),
+  filter(bmi_driver_results,      is_sig) |> pull(label_type),
+  filter(fig5c_bmi,               is_sig) |> pull(label_type)
+)) |> setdiff("Other")
+
+all_sig_age <- unique(c(
+  filter(gene_weight_results_age, is_sig) |> pull(label_type),
+  filter(age_driver_results,      is_sig) |> pull(label_type),
+  filter(fig5c_age,               is_sig) |> pull(label_type)
+)) |> setdiff("Other")
+
+all_sig_gender <- unique(c(
+  filter(gene_weight_results_gender, is_sig) |> pull(label_type),
+  filter(gender_driver_results,      is_sig) |> pull(label_type),
+  filter(fig5c_gender,               is_sig) |> pull(label_type)
+)) |> setdiff("Other")
+
+# plot functions
+plot_volcano_cor <- function(data, x_var, xlab, sig_limits) {
+  sig_data <- filter(data, is_sig)
+  ggplot(data, aes(x = .data[[x_var]], y = p_val)) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    geom_vline(xintercept = 0,    linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    geom_point(data = filter(data, !is_sig), shape = 1, size = 1.5, colour = "grey80") +
+    geom_point(data = sig_data, aes(colour = label_type), shape = 19, size = 2.5) +
+    geom_text_repel(data = sig_data, aes(label = label, colour = label_type),
+                    size = 2.8, fontface = "bold", show.legend = FALSE,
+                    box.padding = 0.4, max.overlaps = 50, na.rm = TRUE) +
+    scale_y_continuous(trans = c("log10", "reverse")) +
+    scale_colour_manual(values = cancer_colours, limits = sig_limits, drop = TRUE) +
+    theme_classic(base_size = 11) +
+    theme(axis.title = element_text(size = 9),
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    labs(x = xlab, y = "p-value", colour = NULL)
+}
+
+plot_volcano_or <- function(data, xlab, sig_limits) {
+  sig_data <- filter(data, is_sig)
+  ggplot(data, aes(x = estimate, y = p_adj)) +
+    geom_hline(yintercept = 0.05, linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    geom_vline(xintercept = 1,    linetype = "dashed", colour = "grey50", linewidth = 0.4) +
+    geom_point(data = filter(data, !is_sig), shape = 1, size = 1.5, colour = "grey80") +
+    geom_point(data = sig_data, aes(colour = label_type), shape = 19, size = 2.5) +
+    geom_text_repel(data = sig_data, aes(label = label, colour = label_type),
+                    size = 2.8, fontface = "bold", show.legend = FALSE,
+                    box.padding = 0.4, max.overlaps = 50, na.rm = TRUE) +
+    scale_x_log10() +
+    scale_y_continuous(trans = c("log10", "reverse")) +
+    scale_colour_manual(values = cancer_colours, limits = sig_limits, drop = TRUE) +
+    theme_classic(base_size = 11) +
+    theme(axis.title = element_text(size = 9),
+          legend.position = "none",
+          panel.grid = element_blank()) +
+    labs(x = xlab, y = "fdr adjusted p-value", colour = NULL)
+}
+
+make_legend <- function(sig_limits) {
+  dummy <- ggplot(tibble(x = 1, y = 1, label_type = sig_limits),
+                  aes(x, y, colour = label_type)) +
+    geom_point() +
+    scale_colour_manual(values = cancer_colours, limits = sig_limits, drop = TRUE) +
+    theme(legend.position = "bottom", legend.text = element_text(size = 8)) +
+    labs(colour = NULL)
+  get_legend(dummy)
+}
+
+# remove ucec due to subtype confounding
+gene_weight_results_bmi <- gene_weight_results_bmi |> filter(cancertype != "UCEC")
+gene_weight_results_age <- gene_weight_results_age |> filter(cancertype != "UCEC")
+bmi_driver_results      <- bmi_driver_results      |> filter(cancertype != "UCEC")
+age_driver_results      <- age_driver_results      |> filter(cancertype != "UCEC")
+fig5c_bmi               <- fig5c_bmi               |> filter(cancertype != "UCEC")
+fig5c_age               <- fig5c_age               |> filter(cancertype != "UCEC")
+
+# generate plots
+p_bmi_a    <- plot_volcano_cor(gene_weight_results_bmi, "cor_val", "spearman rho (bmi)", all_sig_bmi)
+p_bmi_b    <- plot_volcano_cor(bmi_driver_results,      "cor_val", "spearman rho (bmi)", all_sig_bmi)
+p_age_a    <- plot_volcano_cor(gene_weight_results_age, "cor_val", "spearman rho (age)", all_sig_age)
+p_age_b    <- plot_volcano_cor(age_driver_results,      "cor_val", "spearman rho (age)", all_sig_age)
+p_age_c    <- plot_volcano_or(fig5c_age,                "or",      all_sig_age)
+p_gender_a <- plot_volcano_cor(gene_weight_results_gender, "mean_diff", "mean diff in driver weight (male - female)", all_sig_gender)
+p_gender_b <- plot_volcano_cor(gender_driver_results,      "mean_diff", "mean diff in driver mutations (male - female)", all_sig_gender)
+p_gender_c <- plot_volcano_or(fig5c_gender, "or", all_sig_gender)
+
+# combine panels 
+combine_with_legend <- function(p1, p2, p3, sig_limits) {
+  top <- plot_grid(p1, p2, p3, ncol = 3)
+  plot_grid(top, make_legend(sig_limits), ncol = 1, rel_heights = c(10, 1))
+}
+
+combine_with_legend_2 <- function(p1, p2, sig_limits) {
+  top <- plot_grid(p1, p2, ncol = 2)
+  plot_grid(top, make_legend(sig_limits), ncol = 1, rel_heights = c(10, 1))
+}
+
+p_bmi_combined    <- combine_with_legend_2(p_bmi_a, p_bmi_b, all_sig_bmi)
+p_age_combined    <- combine_with_legend(p_age_a, p_age_b, p_age_c, all_sig_age)
+p_gender_combined <- combine_with_legend(p_gender_a, p_gender_b, p_gender_c, all_sig_gender)
+```
+
+
+```{r}
+# save
+ggsave("figures/oncoprint/driver_bmi_combined_pval.png",    p_bmi_combined,    width = 12, height = 7, dpi = 300)
+ggsave("figures/oncoprint/driver_age_combined_pval.png",    p_age_combined,    width = 18, height = 7, dpi = 300)
+ggsave("figures/oncoprint/driver_gender_combined_pval.png", p_gender_combined, width = 18, height = 7, dpi = 300)
+
+print(p_bmi_combined)
+print(p_age_combined)
+print(p_gender_combined)
+
+```
+

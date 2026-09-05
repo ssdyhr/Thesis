@@ -1,0 +1,249 @@
+---
+title: "Pathway Analysis"
+output: html_document
+date: "2026-05-06"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(ggplot2)
+library(scales)
+library(patchwork)
+library(svglite)
+
+# ── Output directory ──────────────────────────────────────────────────────────
+svg_dir <- "svg_outputs"
+dir.create(svg_dir, showWarnings = FALSE)
+
+save_svg <- function(plot, filename, width = 14, height = 7) {
+  if (!is.null(plot)) {
+    ggsave(
+      filename = file.path(svg_dir, paste0(filename, ".svg")),
+      plot     = plot,
+      device   = "svg",
+      width    = width,
+      height   = height
+    )
+  }
+}
+```
+
+## Methylation ORA
+
+```{r methylation_ora}
+methyl_ora <- read.csv("/all_summaries/significant_methylation_ORA.csv")
+
+make_combined_ora <- function(data, analysis_name) {
+  sig <- data %>% filter(analysis == analysis_name)
+  if (nrow(sig) == 0) { message("No data for ", analysis_name); return(NULL) }
+
+  summary_df <- sig %>%
+    group_by(pathway_clean, direction) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(n_signed = ifelse(direction == "Hypomethylated", -n, n)) |> drop_na()
+
+  pathway_order <- summary_df %>%
+    group_by(pathway_clean) %>%
+    summarise(net = sum(n_signed)) %>%
+    arrange(net) %>%
+    pull(pathway_clean)
+
+  summary_df <- summary_df %>%
+    mutate(pathway_clean = factor(pathway_clean, levels = pathway_order))
+
+  x_lim <- max(abs(summary_df$n_signed)) + 1.5
+
+  p_bar <- ggplot(summary_df, aes(x = n_signed, y = pathway_clean, fill = direction)) +
+    geom_bar(stat = "identity", width = 0.75) +
+    scale_fill_manual(values = c("Hypermethylated" = "firebrick",
+                                 "Hypomethylated"  = "steelblue")) +
+    scale_x_continuous(limits = c(-x_lim, x_lim),
+                       labels = function(x) abs(x),
+                       breaks = pretty_breaks(n = 4)) +
+    geom_vline(xintercept = 0, color = "grey30", linewidth = 0.4) +
+    labs(title = paste0(analysis_name, " (Methylation ORA)"),
+         x = "Number of cancer types", y = NULL, fill = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position    = "top",
+          axis.text.y        = element_text(size = 7),
+          axis.text.x        = element_text(size = 8),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank())
+
+  tile_df <- sig %>%
+    mutate(
+      pathway_clean = factor(pathway_clean, levels = pathway_order),
+      prop_DE       = DE / N
+    ) |> drop_na(cancer_type, direction, prop_DE)
+
+  p_tile <- ggplot(tile_df, aes(x = cancer_type, y = pathway_clean,
+                                color = direction, size = prop_DE)) +
+    geom_point(alpha = 0.8) +
+    scale_color_manual(values = c("Hypermethylated" = "firebrick",
+                                  "Hypomethylated"  = "steelblue")) +
+    scale_size_continuous(name = "DE/N", range = c(1, 5)) +
+    labs(x = NULL, y = NULL, color = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position  = "none",
+          axis.text.x      = element_text(angle = 45, hjust = 1, size = 7),
+          axis.text.y      = element_blank(),
+          axis.ticks.y     = element_blank(),
+          panel.grid.major = element_line(color = "grey92"),
+          panel.grid.minor = element_blank())
+
+  p_bar + p_tile + plot_layout(widths = c(1, 2))
+}
+
+p <- make_combined_ora(methyl_ora, "BMI");    save_svg(p, "methylation_ORA_BMI");    p
+p <- make_combined_ora(methyl_ora, "AGE");    save_svg(p, "methylation_ORA_AGE");    p
+p <- make_combined_ora(methyl_ora, "GENDER"); save_svg(p, "methylation_ORA_GENDER"); p
+```
+
+## Methylation Spearman fgsea
+
+```{r methylation_spearman_fgsea}
+methyl_spearman <- read.csv("/all_summaries/significant_methylation_spearman_fgsea.csv")
+
+make_combined_nes <- function(data, analysis_name, data_label) {
+  sig <- data %>% filter(analysis == analysis_name)
+  if (nrow(sig) == 0) { message("No data for ", analysis_name); return(NULL) }
+
+  summary_df <- sig %>%
+    group_by(pathway_clean, direction) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(n_signed = ifelse(direction == "Downregulated", -n, n))
+
+  pathway_order <- summary_df %>%
+    group_by(pathway_clean) %>%
+    summarise(net = sum(n_signed)) %>%
+    arrange(net) %>%
+    pull(pathway_clean)
+
+  summary_df <- summary_df %>%
+    mutate(pathway_clean = factor(pathway_clean, levels = pathway_order))
+
+  x_lim <- max(abs(summary_df$n_signed)) + 1.5
+
+  p_bar <- ggplot(summary_df, aes(x = n_signed, y = pathway_clean, fill = direction)) +
+    geom_bar(stat = "identity", width = 0.75) +
+    scale_fill_manual(values = c("Upregulated"   = "firebrick",
+                                 "Downregulated" = "steelblue")) +
+    scale_x_continuous(limits = c(-x_lim, x_lim),
+                       labels = function(x) abs(x),
+                       breaks = pretty_breaks(n = 4)) +
+    geom_vline(xintercept = 0, color = "grey30", linewidth = 0.4) +
+    labs(title = paste0(analysis_name, " (", data_label, ")"),
+         x = "Number of cancer types", y = NULL, fill = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position    = "top",
+          axis.text.y        = element_text(size = 7),
+          axis.text.x        = element_text(size = 8),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank())
+
+  tile_df <- sig %>%
+    mutate(
+      pathway_clean = factor(pathway_clean, levels = pathway_order),
+      abs_NES       = abs(NES)
+    )
+
+  p_tile <- ggplot(tile_df, aes(x = cancer_type, y = pathway_clean,
+                                color = direction, size = abs_NES)) +
+    geom_point(alpha = 0.8) +
+    scale_color_manual(values = c("Upregulated"   = "firebrick",
+                                  "Downregulated" = "steelblue")) +
+    scale_size_continuous(name = "|NES|", range = c(1, 5)) +
+    labs(x = NULL, y = NULL, color = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position  = "none",
+          axis.text.x      = element_text(angle = 45, hjust = 1, size = 7),
+          axis.text.y      = element_blank(),
+          axis.ticks.y     = element_blank(),
+          panel.grid.major = element_line(color = "grey92"),
+          panel.grid.minor = element_blank())
+
+  p_bar + p_tile + plot_layout(widths = c(1, 2))
+}
+
+p <- make_combined_nes(methyl_spearman, "BMI", "Methylation Spearman fgsea"); save_svg(p, "methylation_spearman_BMI"); p
+p <- make_combined_nes(methyl_spearman, "AGE", "Methylation Spearman fgsea"); save_svg(p, "methylation_spearman_AGE"); p
+```
+
+## RNA GOseq ORA
+
+```{r rna_goseq_ora}
+rna_goseq <- read.csv("/all_summaries/significant_RNA_goseq_ORA.csv")
+
+make_combined_goseq <- function(data, analysis_name) {
+  sig <- data %>% filter(analysis == analysis_name)
+  if (nrow(sig) == 0) { message("No data for ", analysis_name); return(NULL) }
+
+  summary_df <- sig %>%
+    group_by(pathway_clean, direction) %>%
+    summarise(n = n(), .groups = "drop") %>%
+    mutate(n_signed = ifelse(direction == "Downregulated", -n, n))
+
+  pathway_order <- summary_df %>%
+    group_by(pathway_clean) %>%
+    summarise(net = sum(n_signed)) %>%
+    arrange(net) %>%
+    pull(pathway_clean)
+
+  summary_df <- summary_df %>%
+    mutate(pathway_clean = factor(pathway_clean, levels = pathway_order))
+
+  x_lim <- max(abs(summary_df$n_signed)) + 1.5
+
+  p_bar <- ggplot(summary_df, aes(x = n_signed, y = pathway_clean, fill = direction)) +
+    geom_bar(stat = "identity", width = 0.75) +
+    scale_fill_manual(values = c("Upregulated"   = "firebrick",
+                                 "Downregulated" = "steelblue")) +
+    scale_x_continuous(limits = c(-x_lim, x_lim),
+                       labels = function(x) abs(x),
+                       breaks = pretty_breaks(n = 4)) +
+    geom_vline(xintercept = 0, color = "grey30", linewidth = 0.4) +
+    labs(title = paste0(analysis_name, " (RNA GOseq ORA)"),
+         x = "Number of cancer types", y = NULL, fill = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position    = "top",
+          axis.text.y        = element_text(size = 7),
+          axis.text.x        = element_text(size = 8),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank())
+
+  tile_df <- sig %>%
+    mutate(pathway_clean = factor(pathway_clean, levels = pathway_order))
+
+  p_tile <- ggplot(tile_df, aes(x = cancer_type, y = pathway_clean,
+                                color = direction, size = numDEInCat)) +
+    geom_point(alpha = 0.8) +
+    scale_color_manual(values = c("Upregulated"   = "firebrick",
+                                  "Downregulated" = "steelblue")) +
+    scale_size_continuous(name = "DE in cat", range = c(1, 5)) +
+    labs(x = NULL, y = NULL, color = NULL) +
+    theme_bw(base_size = 10) +
+    theme(legend.position  = "none",
+          axis.text.x      = element_text(angle = 45, hjust = 1, size = 7),
+          axis.text.y      = element_blank(),
+          axis.ticks.y     = element_blank(),
+          panel.grid.major = element_line(color = "grey92"),
+          panel.grid.minor = element_blank())
+
+  p_bar + p_tile + plot_layout(widths = c(1, 2))
+}
+
+p <- make_combined_goseq(rna_goseq, "BMI");    save_svg(p, "RNA_goseq_BMI");    p
+p <- make_combined_goseq(rna_goseq, "AGE");    save_svg(p, "RNA_goseq_AGE");    p
+p <- make_combined_goseq(rna_goseq, "GENDER"); save_svg(p, "RNA_goseq_GENDER"); p
+```
+
+## RNA Spearman fgsea
+
+```{r rna_spearman_fgsea}
+rna_spearman <- read.csv("all_summaries/significant_RNA_spearman_fgsea.csv")
+
+p <- make_combined_nes(rna_spearman, "BMI",    "RNA Spearman fgsea"); save_svg(p, "RNA_spearman_BMI");    p
+p <- make_combined_nes(rna_spearman, "AGE",    "RNA Spearman fgsea"); save_svg(p, "RNA_spearman_AGE");    p
+p <- make_combined_nes(rna_spearman, "GENDER", "RNA Spearman fgsea"); save_svg(p, "RNA_spearman_GENDER"); p
+```

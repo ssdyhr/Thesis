@@ -1,0 +1,514 @@
+---
+title: "Oncoprint"
+output: html_document
+date: "2026-06-12"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Driver mutation heatmap 
+
+pipeline? for data:
+
+TCGA MC3 somatic mutations (raw MAF file)
+          ↓
+ANNOVAR  — adds functional annotations, SIFT, COSMIC, gnomAD etc.
+          ↓
+ABSOLUTE or PyClone — adds CCF, clonality estimates
+          ↓
+Custom driver calling script — adds is_driver_mut, pan_cancer_driver,
+                               oncogene, tumor_suppressor columns
+                               likely using Bailey et al. or COSMIC
+                               as the reference driver list
+***Overview***:
+
+**Driver related**
+pan_cancer_driver    → binary, is this mutation a pan-cancer driver?
+is_driver_mut        → binary, is this a driver mutation?
+driver_category      → category of driver
+newDriverCat         → updated driver category
+oncogene             → is the gene an oncogene?
+tumor_suppressor     → is it a tumour suppressor?
+Role                 → likely oncogene/TSG/both
+
+**Mutation identity**
+gene.refgene         → the gene name — this is what links to your expression data
+cancertype           → cancer type per mutation
+sampleid             → links to your expression data
+
+**Mutation effect**
+ccf                  → cancer cell fraction — is the mutation clonal or subclonal?
+prob.clonal          → probability of being clonal
+prob.subclonal       → probability of being subclonal
+is_deleterious       → is the mutation damaging?
+
+
+```{r}
+
+possible_roots <- c("~/GenomeDK", "faststorage/Project", "")
+
+smart_read <- function(relative_path, read_func = readRDS, ...) {
+  full_paths <- file.path(possible_roots, relative_path)
+  existing_path <- full_paths[file.exists(full_paths)][1]
+  
+  if (is.na(existing_path)) {
+    stop(paste("No root for:", relative_path))
+  }
+  message("Loading: ", existing_path)
+  return(read_func(existing_path, ...))
+}
+
+library(tidyverse)
+library(broom)
+
+drivers <- smart_read("thesis/data/TCGA_Derived_data/TCGA_annotated_driver_mutations.rds")
+clin <- smart_read("thesis/data/TCGA_clinical/clinical_dataset.rds")
+
+clin <- clin |> rename(sampleid = `_PATIENT`)
+
+clin$BMI <- clin$weight / (clin$height/100)^2
+
+clin <- clin |>
+  mutate(bmi_groups = case_when(
+    BMI < 18.5              ~ "Normal",
+    BMI >= 18.5 & BMI < 25  ~ "Normal",
+    BMI >= 25 & BMI < 30    ~ "Overweight",
+    BMI >= 30               ~ "Obese",
+    TRUE                    ~ NA_character_
+  ), bmi_groups = factor(bmi_groups, levels = c("Normal", "Overweight", "Obese"))
+  ) |> 
+  mutate(age_cat = if_else(age_at_initial_pathologic_diagnosis < 65, "young","old" ),
+         age_cat = factor(age_cat, levels = c("young", "old"))
+  )
+```
+
+```{r}
+
+drivers %>%
+  filter(pan_cancer_driver == TRUE) %>%
+  distinct(gene.refgene, Role) %>%
+  count(gene.refgene) %>%
+  filter(n > 1) 
+
+```
+
+```{r}
+
+drivers %>%
+  filter(pan_cancer_driver == TRUE) %>%
+  distinct(gene.refgene, Role) %>%
+  filter(gene.refgene %in% (
+    drivers %>%
+      filter(pan_cancer_driver == TRUE) %>%
+      distinct(gene.refgene, Role) %>%
+      count(gene.refgene) %>%
+      filter(n > 1) %>%
+      pull(gene.refgene)
+  )) %>%
+  arrange(gene.refgene) %>%
+  head(20)
+
+```
+
+
+```{r}
+
+drivers_vol <- drivers %>%
+  filter(pan_cancer_driver == TRUE | is_driver_mut == TRUE | is_cosmic_gte_3 == TRUE) %>%
+  select(gene.refgene, cancertype, oncogene, 
+         tumor_suppressor, Role, pan_cancer_driver, sampleid, exonicfunc.refgene) %>%
+  distinct(gene.refgene, sampleid, .keep_all = TRUE) # Explicit distinct() — removes rows where gene + sample are identical keeps the first occurrence of other columns like oncogene, Role etc. I don't want a hit at the same place twice.
+
+# get gene names that appear in at least 10 samples pr cancertype
+# store as a seperate
+common_driver_genes <- drivers_vol %>%
+  group_by(cancertype, gene.refgene) %>%
+  summarise(n = n_distinct(sampleid)) %>%
+  filter(n >= 10) %>%
+  ungroup() %>%
+  distinct(gene.refgene) %>%
+  pull(gene.refgene)
+
+# filter drivers_vol to only common genes
+# now drivers_vol still has all its columns but only frequent genes
+drivers_vol <- drivers_vol %>%
+  filter(gene.refgene %in% common_driver_genes)
+
+# some of them are both characterized as both oncogenes and TMR, because of this i assigned them as both.
+
+# create a clean gene-level Role lookup
+role_lookup <- drivers %>%
+  filter(pan_cancer_driver == TRUE) %>%
+  distinct(gene.refgene, Role) %>%
+  group_by(gene.refgene) %>%
+  summarise(Role_final = ifelse(n() > 1, "Both", as.character(first(Role))),
+            .groups = "drop")
+
+# join back to drivers_vol
+drivers_vol <- drivers_vol %>%
+  left_join(role_lookup, by = "gene.refgene") %>%
+  select(-Role) 
+```
+
+
+```{r}
+
+drivers_vol <- drivers_vol |> 
+  mutate(exonicfunc.refgene = str_trim(exonicfunc.refgene))|>
+  mutate(mutation_type = case_when(
+  exonicfunc.refgene == "nonsynonymous SNV"        ~ "Missense",
+  exonicfunc.refgene == "stopgain"                 ~ "Nonsense",
+  exonicfunc.refgene == "stoploss"                 ~ "Nonstop",
+  exonicfunc.refgene %in% c("frameshift deletion",
+                             "frameshift insertion",
+                             "frameshift substitution") ~ "Frameshift",
+  exonicfunc.refgene %in% c("nonframeshift deletion",
+                             "nonframeshift insertion",
+                             "nonframeshift substitution") ~ "Inframe",
+  is.na(exonicfunc.refgene)                        ~ NA_character_
+))
+
+```
+
+
+### Oncomap
+
+Making the mat. It needs a character matrix.
+
+```{r}
+
+# Values from `mutation_type` are not uniquely identified. I get this because toy cant have multiple mutations in the same gene. So pivot wider does not know which one to put in the cell. 
+drivers_vol <- drivers_vol |>
+  mutate(mutation_type = factor(mutation_type, 
+levels = c("Nonsense", "Frameshift", "Inframe", "Missense", "Nonstop")))|> 
+  group_by(gene.refgene, sampleid) |>
+  slice_min(mutation_type) |>  # picks most severe (order of factors). The convention is to use the most severe one:"Nonsense > Frameshift > Splice > Missense > In-frame > other".
+  ungroup()|>
+  mutate(mutation_type = as.character(mutation_type))
+
+
+# making the matrix for oncoprint.
+mat <- drivers_vol |> 
+  select(sampleid, gene.refgene, mutation_type) |> 
+  pivot_wider(names_from = sampleid, id_cols = gene.refgene, values_from = mutation_type, values_fill = "", values_fn = first) |> 
+  tibble::column_to_rownames("gene.refgene") |> 
+  as.matrix()
+
+mat[is.na(mat)] <- ""
+
+# wanna find the top ones
+ drivers_vol <- drivers_vol |> filter(!is.na(mutation_type)) # should i remove NA's?
+ 
+top_genes <- drivers_vol |> 
+  filter(cancertype == "BLCA") |> # trying with one cancertype first.
+   group_by(gene.refgene) |>
+   summarise(n = n_distinct(sampleid)) |>
+   arrange(desc(n)) |>
+   slice_head(n = 20) |>
+   pull(gene.refgene)
+
+# find BLCA sample IDs
+blca_samples <- drivers_vol |>
+  filter(cancertype == "BLCA") |>
+  pull(sampleid) |>
+  unique()
+
+# Subset matrix til top genes OG kun BLCA samples
+top_mat <- mat[top_genes, colnames(mat) %in% blca_samples]
+
+# making a cancer type vector for column_split in oncoPrint. maybe i could use this one? 
+cancertype_vec <- drivers_vol |> 
+  select(sampleid, cancertype) |> 
+  distinct() |>
+  filter(sampleid %in% colnames(top_mat)) |>
+  arrange(match(sampleid, colnames(top_mat))) |>
+  pull(cancertype)
+
+
+drivers_vol |> group_by(sampleid,cancertype) |> filter(cancertype == "BLCA")
+clin |> group_by(sampleid,`cancer type abbreviation`) |> filter( `cancer type abbreviation` == "BLCA")
+
+sum(drivers_vol$sampleid %in% clin$sampleid)
+
+```
+
+Joining clinical data. 
+
+```{r}
+
+clin_join <- clin |> 
+  select(sampleid, bmi_groups, age_cat, gender, age_at_initial_pathologic_diagnosis) |>
+  distinct(sampleid, .keep_all = TRUE)  # keep only first row per sampleid
+
+
+drivers_vol <- drivers_vol |> 
+  left_join(clin_join, by = 'sampleid', relationship = "many-to-many")
+
+
+```
+
+
+```{r}
+
+# BMI
+bmi_vec <- drivers_vol |>
+  select(sampleid, bmi_groups) |>
+  distinct() |>
+  filter(sampleid %in% colnames(top_mat)) |>
+  arrange(match(sampleid, colnames(top_mat))) |>
+  pull(bmi_groups)
+
+# Age
+age_vec <- drivers_vol |>
+  select(sampleid, age_cat) |>
+  distinct() |>
+  filter(sampleid %in% colnames(top_mat)) |>
+  arrange(match(sampleid, colnames(top_mat))) |>
+  pull(age_cat)
+
+# Gender
+gender_vec <- drivers_vol |>
+  select(sampleid, gender) |>
+  distinct() |>
+  filter(sampleid %in% colnames(top_mat)) |>
+  arrange(match(sampleid, colnames(top_mat))) |>
+  pull(gender)
+
+
+```
+
+
+Making the alter_fun
+
+```{r}
+library(ComplexHeatmap)
+suppressPackageStartupMessages(library(ComplexHeatmap))
+
+col <- c(
+  Missense   = "#008000",
+  Nonsense   = "#000000", 
+  Frameshift = "#FF0000",
+  Inframe    = "#FFA500",
+  Nonstop    = "#0000FF"
+)
+
+alter_fun = list(
+  background = alter_graphic("rect", fill = "#CCCCCC"),
+  Nonsense   = alter_graphic("rect", fill = col["Nonsense"]),
+  Frameshift = alter_graphic("rect", fill = col["Frameshift"]),
+  Inframe    = alter_graphic("rect", fill = col["Inframe"]),
+  Missense   = alter_graphic("rect", fill = col["Missense"]),
+  Nonstop    = alter_graphic("rect", fill = col["Nonstop"])
+)
+
+```
+
+
+```{r}
+
+column_title = "OncoPrint | TCGA | BLCA"
+heatmap_legend_param = list(title = "Alternations", at = c("Missense","Nonsense", "Frameshift", "Inframe","Nonstop"), 
+        labels = c("Missense","Nonsense", "Frameshift", "Inframe","Nonstop"))
+
+oncoplot <- oncoPrint(top_mat,
+          alter_fun = alter_fun,
+          col = col,
+          remove_empty_columns = TRUE,
+          remove_empty_rows = TRUE) 
+
+
+oncoplot2 <- oncoPrint(top_mat,
+          alter_fun = alter_fun,
+          col = col,
+          column_split = bmi_vec,
+          pct_side = "right", row_names_side = "left",
+          top_annotation = HeatmapAnnotation(
+            cbar = anno_oncoprint_barplot(),
+            BMI    = bmi_vec,
+            Age    = age_vec,
+            Gender = gender_vec,
+            col = list(
+              BMI    = c(Normal = "green", Overweight = "orange", Obese = "red"),
+              Age    = c(old = "lightblue", young = "darkblue"),
+              Gender = c(MALE = "lightblue", FEMALE = "pink")
+            )
+          ),
+          remove_empty_columns = TRUE)
+
+
+pdf("figures/oncoplots/oncoprint_BLCA.pdf", width = 20, height = 10)
+draw(oncoplot2)
+dev.off()
+
+```
+
+```{r}
+# removes NA
+keep <- !is.na(bmi_vec) & !is.na(age_vec) & !is.na(gender_vec)
+
+top_mat_clean <- top_mat[, keep]
+bmi_vec_clean <- bmi_vec[keep]
+age_vec_clean <- age_vec[keep]
+gender_vec_clean <- gender_vec[keep]
+
+oncoplot_bmi <- oncoPrint(top_mat_clean,
+          alter_fun = alter_fun,
+          col = col,
+          column_split = bmi_vec_clean,
+          pct_side = "right", row_names_side = "left",
+          top_annotation = HeatmapAnnotation(
+            cbar = anno_oncoprint_barplot(),
+            BMI    = bmi_vec_clean,
+            Age    = age_vec_clean,
+            Gender = gender_vec_clean,
+            col = list(
+              BMI    = c(Normal = "green", Overweight = "orange", Obese = "red"),
+              Age    = c(old = "lightblue", young = "darkblue"),
+              Gender = c(MALE = "lightblue", FEMALE = "pink")
+            )
+          ),
+          remove_empty_columns = TRUE)
+
+oncoplot_age <- oncoPrint(top_mat_clean,
+          alter_fun = alter_fun,
+          col = col,
+          column_split = age_vec_clean,
+          pct_side = "right", row_names_side = "left",
+          top_annotation = HeatmapAnnotation(
+            cbar = anno_oncoprint_barplot(),
+            BMI    = bmi_vec_clean,
+            Age    = age_vec_clean,
+            Gender = gender_vec_clean,
+            col = list(
+              BMI    = c(Normal = "green", Overweight = "orange", Obese = "red"),
+              Age    = c(old = "lightblue", young = "darkblue"),
+              Gender = c(MALE = "lightblue", FEMALE = "pink")
+            )
+          ),
+          remove_empty_columns = TRUE)
+
+pdf("figures/oncoplots/oncoprint_BLCA_bmi.pdf", width = 20, height = 10)
+draw(oncoplot_bmi)
+dev.off()
+
+pdf("figures/oncoplots/oncoprint_BLCA_age.pdf", width = 20, height = 10)
+draw(oncoplot_age)
+dev.off()
+
+```
+
+```{r}
+groups <- c("Normal", "Overweight", "Obese")
+
+for (grp in groups) {
+  keep <- !is.na(bmi_vec) & bmi_vec == grp
+  
+  op <- oncoPrint(top_mat[, keep],
+            alter_fun = alter_fun,
+            col = col,
+            pct_side = "right", row_names_side = "left",
+            column_title = grp,
+            remove_empty_columns = TRUE,
+            remove_empty_rows = TRUE)
+  
+  pdf(paste0("figures/oncoplots/oncoprint_BLCA_", grp, ".pdf"), width = 20, height = 10)
+  draw(op)
+  dev.off()
+}
+
+```
+
+```{r}
+# per cancer type
+for (ct in unique(drivers_vol$cancertype)) {
+  
+  top_genes <- drivers_vol |>
+    filter(cancertype == ct) |>
+    group_by(gene.refgene) |>
+    summarise(n = n_distinct(sampleid)) |>
+    arrange(desc(n)) |>
+    slice_head(n = 20) |>
+    pull(gene.refgene)
+  
+  ct_samples <- drivers_vol |>
+    filter(cancertype == ct) |>
+    pull(sampleid) |>
+    unique()
+  
+  if (length(top_genes) < 2 | length(ct_samples) < 2) next
+  
+  top_mat <- mat[top_genes[top_genes %in% rownames(mat)], 
+                 colnames(mat) %in% ct_samples, drop = FALSE]
+  
+  bmi_vec    <- clin$bmi_groups[match(colnames(top_mat), clin$sampleid)]
+  age_vec    <- clin$age_cat[match(colnames(top_mat), clin$sampleid)]
+  gender_vec <- clin$gender[match(colnames(top_mat), clin$sampleid)]
+  
+  # BMI groups
+  for (grp in c("Normal", "Overweight", "Obese")) {
+    keep <- !is.na(bmi_vec) & bmi_vec == grp
+    if (sum(keep) < 2) next
+    op <- oncoPrint(top_mat[, keep, drop = FALSE],
+              alter_fun = alter_fun, col = col,
+              pct_side = "right", row_names_side = "left",
+              column_title = grp,
+              remove_empty_columns = TRUE,
+              remove_empty_rows = TRUE)
+    pdf(paste0("figures/oncoplots/", ct, "_BMI_", grp, ".pdf"), width = 20, height = 10)
+    draw(op)
+    dev.off()
+  }
+  
+  # Age groups
+  for (grp in c("young", "old")) {
+    keep <- !is.na(age_vec) & age_vec == grp
+    if (sum(keep) < 2) next
+    op <- oncoPrint(top_mat[, keep, drop = FALSE],
+              alter_fun = alter_fun, col = col,
+              pct_side = "right", row_names_side = "left",
+              column_title = grp,
+              remove_empty_columns = TRUE,
+              remove_empty_rows = TRUE)
+    pdf(paste0("figures/oncoplots/", ct, "_Age_", grp, ".pdf"), width = 20, height = 10)
+    draw(op)
+    dev.off()
+  }
+  
+  # Gender groups
+  for (grp in c("MALE", "FEMALE")) {
+    keep <- !is.na(gender_vec) & gender_vec == grp
+    if (sum(keep) < 2) next
+    op <- oncoPrint(top_mat[, keep, drop = FALSE],
+              alter_fun = alter_fun, col = col,
+              pct_side = "right", row_names_side = "left",
+              column_title = grp,
+              remove_empty_columns = TRUE,
+              remove_empty_rows = TRUE)
+    pdf(paste0("figures/oncoplots/", ct, "_Gender_", grp, ".pdf"), width = 20, height = 10)
+    draw(op)
+    dev.off()
+  }
+}
+
+```
+
+
+
+```{r}
+for (ct in unique(drivers_vol$cancertype)) {
+  ct_samples <- drivers_vol |>
+    filter(cancertype == ct) |>
+    pull(sampleid) |>
+    unique()
+  
+  bmi_vec    <- clin$bmi_groups[match(ct_samples, clin$sampleid)]
+  age_vec    <- clin$age_cat[match(ct_samples, clin$sampleid)]
+  gender_vec <- clin$gender[match(ct_samples, clin$sampleid)]
+  
+  cat(ct, "- BMI:", table(bmi_vec), "| Age:", table(age_vec), "| Gender:", table(gender_vec), "\n")
+}
+
+```
+

@@ -1,0 +1,271 @@
+```{r}
+library(tidyverse)
+library(broom)
+library(ggbeeswarm)
+
+# load clinical data
+clin <- smart_read("thesis/data/TCGA_clinical/clinical_dataset.rds")
+clin <- clin |> rename(sampleid = `_PATIENT`)
+
+clin <- clin |>
+  mutate(BMI = weight / (height/100)^2) |>
+  mutate(bmi_groups = case_when(
+    BMI < 18.5             ~ "Normal",
+    BMI >= 18.5 & BMI < 25 ~ "Normal",
+    BMI >= 25 & BMI < 30   ~ "Overweight",
+    BMI >= 30              ~ "Obese",
+    TRUE                   ~ NA_character_
+  ), bmi_groups = factor(bmi_groups, levels = c("Normal", "Overweight", "Obese"))) |>
+  mutate(age_cat = if_else(age_at_initial_pathologic_diagnosis < 65, "young", "old"),
+         age_cat = factor(age_cat, levels = c("young", "old")))
+
+all_cs <- list.files(
+  file.path(possible_roots[file.exists(possible_roots)][1], "thesis/data/cibersort_absolute"),
+  pattern = "_CS\\.csv$",
+  full.names = FALSE
+) |>
+  lapply(function(f) {
+    cancer_type <- sub("_CS\\.csv$", "", f)
+    df <- smart_read(paste0("/thesis/data/cibersort_absolute/", f), read_func = read_csv)
+    df$cancer_type <- cancer_type
+    df
+  }) |>
+  bind_rows()
+
+# load tcra t cell fraction data
+tcra <- read_tsv("/TCellExTRECT_TCGA_20240404.tsv") |>
+  rename(SampleID = Sample_ID)
+
+tcra_tumor <- tcra |>
+  filter(Type == "Tumor", qcFit <= 4) |>
+  filter(Sample_Type == "Primary Tumor") |>
+  rename(tcell_adjusted_tumor = TCRA.tcell.fraction.adj) |>
+  select(SampleID, tcell_adjusted_tumor)
+
+tcra_blood <- tcra |>
+  filter(Type == "Normal", qcFit <= 4) |>
+  filter(Sample_Type == "Blood Derived Normal") |>
+  rename(tcell_blood = TCRA.tcell.fraction) |>
+  select(SampleID, tcell_blood)
+
+```
+
+
+```{r}
+cibersort_grouped <- all_cs |>
+  filter(`P-value` < 0.05) |>
+  mutate(across(`B cells naive`:`Neutrophils`,
+                ~ . * `Absolute score (sig.score)`)) |>
+  mutate(
+    Total_T_cells     = `T cells CD8` + `T cells CD4 naive` +
+                        `T cells CD4 memory resting` + `T cells CD4 memory activated` +
+                        `T cells follicular helper` + `T cells regulatory (Tregs)` +
+                        `T cells gamma delta`,
+    Total_B_cells     = `B cells naive` + `B cells memory` + `Plasma cells`,
+    Total_Macrophages = `Macrophages M0` + `Macrophages M1` + `Macrophages M2`,
+    Total_NK_cells    = `NK cells resting` + `NK cells activated`,
+    Total_Myeloid     = Monocytes + `Dendritic cells resting` + `Dendritic cells activated` +
+                        `Mast cells resting` + `Mast cells activated` +
+                        Eosinophils + Neutrophils,
+    Total_Lymphocytes = Total_T_cells + Total_B_cells + Total_NK_cells,
+    CD4_inactive      = `T cells CD4 naive` + `T cells CD4 memory resting`,
+    CD4_active        = `T cells CD4 memory activated`,
+    CD4_ratio         = CD4_active / (CD4_inactive + 0.001)
+  ) |>
+  # standardise sample ids to match clin format
+  mutate(S_ID = str_replace_all(Mixture, "\\.", "-")) |>
+  filter(str_detect(S_ID, "-01")) |>
+  arrange(S_ID) |>
+  mutate(temp_id = substr(S_ID, 1, 12)) |>
+  distinct(temp_id, .keep_all = TRUE) |>
+  mutate(S_ID = temp_id) |>
+  dplyr::select(-temp_id, -Mixture)
+
+clin_cs <- clin |>
+  left_join(cibersort_grouped, by = c("SampleID" = "S_ID")) |>
+  left_join(tcra_tumor, by = "SampleID") |>
+  left_join(tcra_blood, by = "SampleID")
+
+cat("rows with Total_T_cells non-NA:", sum(!is.na(clin_cs$Total_T_cells)), "\n")
+cat("rows with tcell_adjusted_tumor non-NA:", sum(!is.na(clin_cs$tcell_adjusted_tumor)), "\n")
+cat("rows with tcell_blood non-NA:", sum(!is.na(clin_cs$tcell_blood)), "\n")
+
+cell_types_grouped <- c(
+  "Total_T_cells",
+  "Total_B_cells",
+  "Total_Macrophages",
+  "Total_NK_cells",
+  "Total_Myeloid",
+  "Total_Lymphocytes",
+  "CD4_ratio",
+  "T cells CD8",
+  "T cells regulatory (Tregs)",
+  "T cells CD4 memory activated",
+  "T cells CD4 naive",
+  "tcell_adjusted_tumor",
+  "tcell_blood"
+)
+
+bmi_pvals <- map_dfr(cell_types_grouped, function(ct) {
+  clin_cs |>
+    drop_na(BMI, !!sym(ct)) |>
+    filter(BMI >= 10, BMI <= 60) |>
+    group_by(`cancer type abbreviation`) |>
+    filter(n() >= 10) |>
+    group_modify(~{
+      tryCatch(
+        tidy(cor.test(.x$BMI, .x[[ct]], method = "spearman")) |>
+          mutate(effect_size_rho = estimate),
+        error = function(e) tibble()
+      )
+    }) |>
+    ungroup() |>
+    mutate(cell_type = ct,
+           p_adj = p.adjust(p.value, method = "BH"))
+})
+
+gender_pvals <- map_dfr(cell_types_grouped, function(ct) {
+  clin_cs |>
+    drop_na(gender, !!sym(ct)) |>
+    group_by(`cancer type abbreviation`) |>
+    filter(n() >= 10, n_distinct(gender) > 1) |>
+    group_modify(~{
+      tryCatch({
+        res <- wilcox.test(.x[[ct]] ~ as.factor(.x$gender))
+        counts <- table(.x$gender)
+        n1 <- counts[1]; n2 <- counts[2]
+        r <- 1 - (2 * res$statistic) / (n1 * n2)
+        tidy(res) |> mutate(effect_size_r = as.numeric(r))
+      }, error = function(e) tibble())
+    }) |>
+    ungroup() |>
+    mutate(cell_type = ct,
+           p_adj = p.adjust(p.value, method = "BH"))
+})
+
+age_pvals <- map_dfr(cell_types_grouped, function(ct) {
+  clin_cs |>
+    drop_na(age_at_initial_pathologic_diagnosis, !!sym(ct)) |>
+    group_by(`cancer type abbreviation`) |>
+    filter(n() >= 10) |>
+    group_modify(~{
+      tryCatch(
+        tidy(cor.test(.x$age_at_initial_pathologic_diagnosis, .x[[ct]], method = "spearman")) |>
+          mutate(effect_size_rho = estimate),
+        error = function(e) tibble()
+      )
+    }) |>
+    ungroup() |>
+    mutate(cell_type = ct,
+           p_adj = p.adjust(p.value, method = "BH"))
+})
+```
+
+
+```{r}
+# plot functions
+plot_bmi_cs <- function(ct) {
+  pvals <- bmi_pvals |> filter(cell_type == ct)
+  clin_cs |>
+    drop_na(BMI, !!sym(ct)) |>
+    filter(BMI >= 10, BMI <= 60) |>
+    group_by(`cancer type abbreviation`) |>
+    filter(n() >= 10) |>
+    ungroup() |>
+    left_join(pvals |> select(`cancer type abbreviation`, p_adj, effect_size_rho),
+              by = "cancer type abbreviation") |>
+    mutate(p_label = ifelse(p_adj < 0.05,
+                            paste0("p.adj=", signif(p_adj, 2), " ρ=", round(effect_size_rho, 2), " *"),
+                            paste0("p.adj=", signif(p_adj, 2), " ρ=", round(effect_size_rho, 2)))) |>
+    ggplot(aes(x = BMI, y = !!sym(ct))) +
+    geom_point(alpha = 0.2, size = 1) +
+    geom_smooth(method = "lm", color = "red", se = TRUE) +
+    geom_text(aes(label = p_label), x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+              size = 3, inherit.aes = FALSE) +
+    facet_wrap(~`cancer type abbreviation`, scales = "free") +
+    theme_bw() +
+    theme(strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 10),
+          panel.grid.minor = element_blank()) +
+    labs(x = "BMI", y = ct)
+}
+```
+
+
+```{r}
+plot_gender_cs <- function(ct) {
+  pvals <- gender_pvals |> filter(cell_type == ct)
+  clin_cs |>
+    drop_na(gender, !!sym(ct)) |>
+    group_by(`cancer type abbreviation`) |>
+    filter(n() >= 10, n_distinct(gender) > 1) |>
+    ungroup() |>
+    left_join(pvals |> select(`cancer type abbreviation`, p_adj, effect_size_r),
+              by = "cancer type abbreviation") |>
+    mutate(p_label = ifelse(p_adj < 0.05,
+                            paste0("p.adj=", signif(p_adj, 2), " r=", round(effect_size_r, 2), " *"),
+                            paste0("p.adj=", signif(p_adj, 2), " r=", round(effect_size_r, 2)))) |>
+    ggplot(aes(x = gender, y = !!sym(ct))) +
+    geom_violin(scale = "width", show.legend = FALSE) +
+    geom_quasirandom(aes(color = gender), size = 1, alpha = 0.4, width = 0.2,
+                     method = "quasirandom") +
+    geom_text(aes(label = p_label), x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+              size = 3, inherit.aes = FALSE) +
+    facet_wrap(~`cancer type abbreviation`, scales = "free_y") +
+    scale_y_continuous(expand = expansion(mult = c(0.05, 0.4))) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 11),
+          legend.position = "bottom",
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_blank()) +
+    labs(x = "sex", y = ct, color = "sex")
+}
+```
+
+
+```{r}
+plot_age_cs <- function(ct) {
+  pvals <- age_pvals |> filter(cell_type == ct)
+  clin_cs |>
+    drop_na(age_at_initial_pathologic_diagnosis, !!sym(ct)) |>
+    group_by(`cancer type abbreviation`) |>
+    filter(n() >= 10) |>
+    ungroup() |>
+    left_join(pvals |> select(`cancer type abbreviation`, p_adj, effect_size_rho),
+              by = "cancer type abbreviation") |>
+    mutate(p_label = ifelse(p_adj < 0.05,
+                            paste0("p.adj=", signif(p_adj, 2), " ρ=", round(effect_size_rho, 2), " *"),
+                            paste0("p.adj=", signif(p_adj, 2), " ρ=", round(effect_size_rho, 2)))) |>
+    ggplot(aes(x = age_at_initial_pathologic_diagnosis, y = !!sym(ct))) +
+    geom_point(alpha = 0.2, size = 1) +
+    geom_smooth(method = "lm", color = "blue", se = TRUE) +
+    geom_text(aes(label = p_label), x = -Inf, y = Inf, hjust = -0.1, vjust = 1.5,
+              size = 3, inherit.aes = FALSE) +
+    facet_wrap(~`cancer type abbreviation`, scales = "free") +
+    theme_bw() +
+    theme(strip.background = element_blank(),
+          strip.text = element_text(face = "bold", size = 10),
+          panel.grid.minor = element_blank()) +
+    labs(x = "age", y = ct)
+}
+```
+
+
+```{r}
+# save all plots
+dir.create("figures/cibersort", showWarnings = FALSE)
+
+for (ct in cell_types_grouped) {
+  safe_name <- gsub("[^a-zA-Z0-9]", "_", ct)
+  ggsave(paste0("figures/cibersort/", safe_name, "_bmi.png"),
+         plot_bmi_cs(ct), width = 16, height = 10, dpi = 300)
+  ggsave(paste0("figures/cibersort/", safe_name, "_gender.png"),
+         plot_gender_cs(ct), width = 16, height = 10, dpi = 300)
+  ggsave(paste0("figures/cibersort/", safe_name, "_age.png"),
+         plot_age_cs(ct), width = 16, height = 10, dpi = 300)
+}
+```
+
+

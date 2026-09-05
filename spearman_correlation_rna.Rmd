@@ -1,0 +1,371 @@
+---
+title: "Spearman fgsea Analysis"
+output: html_document
+date: "2026-04-23"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)
+library(matrixStats)
+library(DESeq2)
+library(biomaRt)
+library(msigdbr)
+library(fgsea)
+library(stats)
+```
+
+# loading data
+```{r load_data}
+load("tcga_tpm_list.TOIL_RSEM.20190228.RData")
+clinical_dataset <- readRDS("TCGA_clinical/clinical_dataset.rds")
+
+# clinical data
+clinical_dataset$BMI <- clinical_dataset$weight / (clinical_dataset$height / 100)^2
+
+clinical_dataset <- clinical_dataset |>
+  mutate(
+    bmi_groups = case_when(
+      BMI < 18.5             ~ "Normal",
+      BMI >= 18.5 & BMI < 25 ~ "Normal",
+      BMI >= 25  & BMI < 30  ~ "Overweight",
+      BMI >= 30              ~ "Obese",
+      TRUE                   ~ NA_character_
+    ),
+    bmi_groups = factor(bmi_groups, levels = c("Normal", "Overweight", "Obese")),
+    age_cat    = if_else(age_at_initial_pathologic_diagnosis < 65, "young", "old"),
+    age_cat    = factor(age_cat, levels = c("young", "old")),
+    bmi_binary = ifelse(BMI >= 25, "HighBMI", "Normal"),
+    bmi_binary = factor(bmi_binary, levels = c("Normal", "HighBMI"))
+  ) |>
+  distinct(sample, .keep_all = TRUE)
+```
+
+# annotation
+
+```{r annotation}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", mirror = "useast")
+
+genes <- getBM(
+  attributes = c("ensembl_gene_id", "external_gene_name", "chromosome_name", "transcript_biotype"),
+  filters    = c("transcript_biotype", "chromosome_name"),
+  values     = list("protein_coding", c(1:22)),
+  mart       = ensembl
+)
+genes <- genes[!duplicated(genes$ensembl_gene_id), ]
+```
+
+# genesets
+
+```{r gene_sets}
+hallmark <- msigdbr(species = "Homo sapiens", collection = "H") %>% 
+  split(x = .$ensembl_gene, f = .$gs_name)
+```
+
+# 
+
+```{r functions}
+# Filter to a single cancer type and return expression + clinical data
+filter_cancertype <- function(cancer_type, drop_list) {
+  clin_final <- clinical_dataset |>
+    filter(`cancer type abbreviation` == cancer_type) |>
+    drop_na(all_of(drop_list)) |>
+    distinct(`_PATIENT`, .keep_all = TRUE)
+
+  rna_matrix <- tcga_tpm_list[[cancer_type]]
+
+  # Keep only expressed genes
+  keep      <- rowSums(rna_matrix) > 0
+  rna_matrix <- rna_matrix[keep, ]
+
+  # Align samples
+  common_ids <- intersect(clin_final$sample, colnames(rna_matrix))
+  if (length(common_ids) < 10) {
+    message("Too few samples for ", cancer_type, " — skipping")
+    return(NULL)
+  }
+  expr_final <- rna_matrix[, common_ids]
+  clin_final <- clin_final |>
+    filter(sample %in% common_ids) |>
+    arrange(match(sample, common_ids))
+
+  # strip Ensembl version numbers
+  gene_names        <- sub("\\..*$", "", rownames(expr_final))
+  expr_final        <- round(apply(expr_final, 2, as.numeric))
+  rownames(expr_final) <- gene_names
+
+  # Keep only autosomal protein-coding genes
+  expr_final <- expr_final[rownames(expr_final) %in% genes$ensembl_gene_id, ]
+
+  # filtering expressed in ≥10% of samples
+  keep_genes   <- rowSums(expr_final > 0.5) > (ncol(expr_final) * 0.10)
+  expr_filtered <- expr_final[keep_genes, ]
+
+  # top 2000 most variable genes (supervisor recommendation)
+  gene_variability  <- rowSds(expr_filtered)
+  top_idx           <- order(gene_variability, decreasing = TRUE)[1:min(2000, nrow(expr_filtered))]
+  expr_top_var      <- expr_filtered[top_idx, ]
+
+  list(expr = expr_top_var, clin = clin_final)
+}
+
+# run Spearman correlation and return ranked data frame
+run_spearman <- function(results, variable) {
+  cor_results <- apply(results$expr, 1, function(gene_expr) {
+    cor.test(gene_expr, variable, method = "spearman", exact = FALSE)
+  })
+  rho  <- sapply(cor_results, function(x) unname(x$estimate))
+  pval <- sapply(cor_results, function(x) x$p.value)
+
+  data.frame(
+    gene = names(rho),
+    rho  = rho,
+    pval = pval,
+    padj = p.adjust(pval, method = "BH")
+  ) |> arrange(desc(abs(rho)))
+}
+
+# build ranked list for fgsea from correlation data frame
+make_rankings <- function(cor_df) {
+  r <- cor_df$rho
+  names(r) <- cor_df$gene
+  sort(r, decreasing = TRUE)
+}
+```
+
+ output
+
+```{r dirs}
+dir.create("fgsea_spearman/rankings", recursive = TRUE, showWarnings = FALSE)
+```
+
+# bmi: Spearman fgsea across cancer
+
+```{r bmi_loop}
+cancer_types <- intersect(
+  unique(clinical_dataset$`cancer type abbreviation`),
+  names(tcga_tpm_list)
+)
+
+bmi_drop <- c("BMI")   # only need BMI to be non-missing
+
+for (i in cancer_types) {
+  tryCatch({
+    message("BMI — Processing: ", i)
+
+    results <- filter_cancertype(i, drop_list = bmi_drop)
+    if (is.null(results)) next
+
+    cor_df   <- run_spearman(results, results$clin$BMI)
+    rankings <- make_rankings(cor_df)
+
+    # Save rankings for diagnostic plots later
+    saveRDS(rankings, paste0("fgsea_spearman/rankings/", i, "_rankings_BMI.rds"))
+
+    gseares <- fgsea(
+      pathways  = hallmark,
+      stats     = rankings,
+      scoreType = "std",
+      minSize   = 10,
+      maxSize   = 500,
+      nproc     = 1
+    )
+
+    gseares_df             <- as.data.frame(gseares)
+    gseares_df$cancer_type <- i   # attach label here for safety
+
+    saveRDS(gseares_df, paste0("fgsea_spearman/", i, "_hallmark_BMI.rds"))
+    message("BMI — Done: ", i)
+
+  }, error = function(e) {
+    message("BMI — Failed for: ", i, "\n  Error: ", e$message)
+  })
+}
+```
+
+# age: spearman fgsea across cancer types
+
+```{r age_loop}
+age_drop <- c("age_at_initial_pathologic_diagnosis")
+
+for (i in cancer_types) {
+  tryCatch({
+    message("AGE — Processing: ", i)
+
+    results <- filter_cancertype(i, drop_list = age_drop)
+    if (is.null(results)) next
+
+    cor_df   <- run_spearman(results, results$clin$age_at_initial_pathologic_diagnosis)
+    rankings <- make_rankings(cor_df)
+
+    # Save rankings for diagnostic plots later
+    saveRDS(rankings, paste0("fgsea_spearman/rankings/", i, "_rankings_AGE.rds"))
+
+    gseares <- fgsea(
+      pathways  = hallmark,
+      stats     = rankings,
+      scoreType = "std",
+      minSize   = 10,
+      maxSize   = 500,
+      nproc     = 1
+    )
+
+    gseares_df             <- as.data.frame(gseares)
+    gseares_df$cancer_type <- i   # attach label here for safety
+
+    saveRDS(gseares_df, paste0("fgsea_spearman/", i, "_hallmark_AGE.rds"))
+    message("AGE — Done: ", i)
+
+  }, error = function(e) {
+    message("AGE — Failed for: ", i, "\n  Error: ", e$message)
+  })
+}
+```
+
+# results
+```{r load_results}
+# bmi
+bmi_files      <- list.files("fgsea_spearman", full.names = TRUE, pattern = "_hallmark_BMI\\.rds$")
+all_results_bmi <- lapply(bmi_files, function(f) {
+  df             <- readRDS(f)
+  # cancer_type already attached in loop, but strip filename as fallback
+  if (!"cancer_type" %in% colnames(df))
+    df$cancer_type <- sub("_hallmark_BMI\\.rds$", "", basename(f))
+  df
+}) |> bind_rows()
+
+# age
+age_files      <- list.files("fgsea_spearman", full.names = TRUE, pattern = "_hallmark_AGE\\.rds$")
+all_results_age <- lapply(age_files, function(f) {
+  df             <- readRDS(f)
+  if (!"cancer_type" %in% colnames(df))
+    df$cancer_type <- sub("_hallmark_AGE\\.rds$", "", basename(f))
+  df
+}) |> bind_rows()
+
+saveRDS(all_results_bmi, "fgsea_spearman/all_results_BMI.rds")
+saveRDS(all_results_age, "fgsea_spearman/all_results_AGE.rds")
+```
+
+# significant
+
+```{r sig_results}
+sig_bmi <- all_results_bmi |> filter(padj < 0.05)
+sig_age <- all_results_age |> filter(padj < 0.05)
+
+message("Significant BMI pathway-cancer combinations: ", nrow(sig_bmi))
+message("Significant AGE pathway-cancer combinations: ", nrow(sig_age))
+```
+
+# NES heatmap age
+
+```{r heatmap_age}
+library(pheatmap)
+
+nes_matrix_age <- all_results_age |>
+  filter(padj < 0.05) |>
+  dplyr::select(pathway, cancer_type, NES) |>
+  pivot_wider(names_from = cancer_type, values_from = NES, values_fill = 0)
+
+mat_age      <- as.matrix(nes_matrix_age[, -1])
+rownames(mat_age) <- nes_matrix_age$pathway
+row_order    <- order(rowMeans(mat_age, na.rm = TRUE))
+max_val      <- max(abs(mat_age), na.rm = TRUE)
+
+pdf("heatmap_age.pdf")
+pheatmap(
+  mat_age[row_order, ],
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  treeheight_row = 0,
+  treeheight_col = 0,
+  color          = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks         = seq(-max_val, max_val, length.out = 101),
+  main           = "Hallmark pathways NES (AGE)"
+)
+dev.off()
+```
+
+# NES heatmap bmi
+
+```{r heatmap_bmi}
+nes_matrix_bmi <- all_results_bmi |>
+  filter(padj < 0.05) |>
+  dplyr::select(pathway, cancer_type, NES) |>
+  pivot_wider(names_from = cancer_type, values_from = NES, values_fill = 0)
+
+mat_bmi      <- as.matrix(nes_matrix_bmi[, -1])
+rownames(mat_bmi) <- nes_matrix_bmi$pathway
+row_order    <- order(rowMeans(mat_bmi, na.rm = TRUE))
+max_val      <- max(abs(mat_bmi), na.rm = TRUE)
+
+pdf("heatmap_bmi.pdf")
+pheatmap(
+  mat_bmi[row_order, ],
+  cluster_rows   = FALSE,
+  cluster_cols   = FALSE,
+  treeheight_row = 0,
+  treeheight_col = 0,
+  color          = colorRampPalette(c("steelblue", "white", "firebrick"))(100),
+  breaks         = seq(-max_val, max_val, length.out = 101),
+  main           = "Hallmark pathways NES (BMI)"
+)
+dev.off()
+```
+
+# Enrichment plots, Using these to check that enrichment signals are not driven by a single gene
+
+```{r enrichment_plots}
+library(ggplot2)
+
+save_enrichment_plots <- function(all_results, variable, padj_cutoff = 0.05) {
+  
+  out_dir <- paste0("fgsea_spearman/enrichment_plots/", variable)
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  cancer_types <- unique(all_results$cancer_type)
+  
+  for (ct in cancer_types) {
+    
+    # Load rankings for this cancer type
+    rankings_file <- paste0("fgsea_spearman/rankings/", ct, "_rankings_", variable, ".rds")
+    if (!file.exists(rankings_file)) {
+      message("No rankings file for ", ct, " — skipping")
+      next
+    }
+    rankings <- readRDS(rankings_file)
+    
+    # get significant pathways for this cancer type
+    sig_pathways <- all_results |>
+      filter(cancer_type == ct, padj < padj_cutoff) |>
+      arrange(padj) |>
+      pull(pathway)
+    
+    if (length(sig_pathways) == 0) {
+      message("No significant pathways for ", ct, " — skipping")
+      next
+    }
+    
+    pdf_path <- paste0(out_dir, "/", ct, "_", variable, "_enrichment_plots.pdf")
+    pdf(pdf_path, width = 8, height = 5)
+    
+    for (pw in sig_pathways) {
+      if (!pw %in% names(hallmark)) next
+      p <- plotEnrichment(hallmark[[pw]], rankings) +
+        labs(
+          title    = paste(ct, variable, sep = " | "),
+          subtitle = pw
+        ) +
+        theme_bw(base_size = 11)
+      print(p)
+    }
+    
+    dev.off()
+    message("Saved: ", pdf_path)
+  }
+}
+
+# Run for both variables
+save_enrichment_plots(all_results_bmi, "BMI")
+save_enrichment_plots(all_results_age, "AGE")
+```
